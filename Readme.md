@@ -22,7 +22,7 @@ def client
 ## Use Client
 
 ```
-client.post(url: '/v1/repos', payload: {ruby: "hash"}, headers: {"X-Request-Header: "123"})
+client.post(url: '/v1/repos', body: {ruby: "hash"}, headers: {"X-Request-Header: "123"})
 
 client.get(url: '/v1/repos', params: {username: "chowly"})
 ```
