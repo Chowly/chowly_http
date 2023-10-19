@@ -1,0 +1,7 @@
+HTTP/1.1 200 OK
+This-is-a-proxy-header: Neat
+This-is-also-a-proxyheader: Cool
+
+HTTP/1.1 200 OK
+This-is-a-normal-header: Good
+This-is-not: Nope
