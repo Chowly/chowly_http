@@ -9,7 +9,7 @@ module ChowlyHttp
   class Client
 
     attr_accessor :http_clients, :base_url, :app, :timeout, :open_timeout, :quick, :debug, :common_headers,
-                  :verify_ssl, :follow_redirects, :raw, :proxy, :http_version, :logger
+                  :verify_ssl, :follow_redirects, :raw, :proxy, :http_version, :logger, :param_encoder
 
     #
     # initialize - Make an new instance of the client
@@ -21,7 +21,7 @@ module ChowlyHttp
     # @param [Hash] common_headers Headers to send with every client reqeust
     # @param [Logger] a tagged logger
     #
-    def initialize(app: nil, proxy: nil, base_url: nil, timeout: nil, open_timeout: nil, quick: nil, debug: false, common_headers: {}, http_version: nil, verify_ssl: true, raw: false, follow_redirects: true, logger: nil)
+    def initialize(app: nil, proxy: nil, base_url: nil, timeout: nil, open_timeout: nil, quick: nil, debug: false, common_headers: {}, http_version: nil, verify_ssl: true, raw: false, follow_redirects: true, logger: nil, param_encoder: nil)
       self.http_clients   = {}
       self.timeout        = timeout || 15
       self.open_timeout   = open_timeout || 15
@@ -34,6 +34,7 @@ module ChowlyHttp
       self.follow_redirects = follow_redirects
       self.http_version = http_version
       self.proxy = proxy
+      self.param_encoder = param_encoder
       self.raw = raw
       self.logger = Logger.new(STDOUT)
     end
@@ -210,6 +211,7 @@ module ChowlyHttp
           conn.response :follow_redirects, limit: 3, standards_compliant: true if follow_redirects
           conn.response :logger, ::Logger.new(STDOUT), bodies: true if self.debug
           conn.proxy = Faraday::ProxyOptions.from(proxy) if proxy.present?
+          conn.options.params_encoder = self.param_encoder if self.param_encoder.present?
           conn.adapter :typhoeus, http_version: self.http_version if self.http_version.present?
         end
       end
