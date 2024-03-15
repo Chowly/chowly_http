@@ -2,6 +2,6 @@
 
 module ChowlyHttp
 
-  VERSION = '0.1.0'
+  VERSION = '2.9.0'
 
 end

@@ -9,7 +9,7 @@ module ChowlyHttp
   class Client
 
     attr_accessor :http_clients, :base_url, :app, :timeout, :open_timeout, :quick, :debug, :common_headers,
-                  :verify_ssl, :params_encoder, :follow_redirects, :raw, :proxy, :http_version, :logger
+                  :verify_ssl, :follow_redirects, :raw, :proxy, :http_version, :logger
 
     #
     # initialize - Make an new instance of the client
@@ -21,7 +21,7 @@ module ChowlyHttp
     # @param [Hash] common_headers Headers to send with every client reqeust
     # @param [Logger] a tagged logger
     #
-    def initialize(app: nil, proxy: nil, base_url: nil, timeout: nil, open_timeout: nil, quick: nil, debug: false, common_headers: {}, http_version: nil, verify_ssl: true, raw: false, params_encoder: nil, follow_redirects: true, logger: nil)
+    def initialize(app: nil, proxy: nil, base_url: nil, timeout: nil, open_timeout: nil, quick: nil, debug: false, common_headers: {}, http_version: nil, verify_ssl: true, raw: false, follow_redirects: true, logger: nil)
       self.http_clients   = {}
       self.timeout        = timeout || 15
       self.open_timeout   = open_timeout || 15
@@ -31,7 +31,6 @@ module ChowlyHttp
       self.quick          = quick
       self.verify_ssl     = verify_ssl
       self.debug          = debug
-      self.params_encoder = params_encoder
       self.follow_redirects = follow_redirects
       self.http_version = http_version
       self.proxy = proxy
@@ -49,7 +48,7 @@ module ChowlyHttp
     #
     # @return [Faraday::Response] The faraday response for the request
     #
-    def request(method:, url:, headers: {}, body: {}, proxy: nil, proxy_headers: nil, quick: nil, follow_redirects: nil)
+    def request(method:, url:, headers: {}, body: {}, proxy: nil, quick: nil, follow_redirects: nil)
       proxy ||= self.proxy
       conn, path = nil
       if url.start_with?('http')
@@ -77,20 +76,17 @@ module ChowlyHttp
       logger.info(tags: ["ExtReqID=#{external_request_id}", 'STARTED'], message: "#{method.upcase} \"#{full_url}\"")
       logger.info(tags: ["ExtReqID=#{external_request_id}", 'HEADERS'], message: headers || {})
       logger.info(tags: ["ExtReqID=#{external_request_id}", 'PROXY'], message: proxy || 'nil')
-      logger.info(tags: ["ExtReqID=#{external_request_id}", 'PROXY HEADERS'], message: proxy_headers || {})
       logger.info(tags: ["ExtReqID=#{external_request_id}", 'BODY'], message: body)
       external_request_start_time = Time.now
 
       begin
         resp = if method == :options
                  conn.run_request(method, path, nil, headers) do |req|
-                   req.proxy_headers = proxy_headers if proxy_headers.present?
                    req.body = body.to_json if body.present? && !body.is_a?(String) && is_json
                  end
                else
                  conn.send(method, path, body) do |req|
                    req.headers = headers if headers.present?
-                   req.proxy_headers = proxy_headers if proxy_headers.present?
                    req.body = body.to_json if body.present? && !body.is_a?(String) && is_json
                  end
                end
@@ -214,7 +210,6 @@ module ChowlyHttp
           conn.response :follow_redirects, limit: 3, standards_compliant: true if follow_redirects
           conn.response :logger, ::Logger.new(STDOUT), bodies: true if self.debug
           conn.proxy = Faraday::ProxyOptions.from(proxy) if proxy.present?
-          conn.options.params_encoder = self.params_encoder || ChowlyHttp::UnorderedEncoder
           conn.adapter :typhoeus, http_version: self.http_version if self.http_version.present?
         end
       end

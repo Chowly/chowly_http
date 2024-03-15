@@ -10,10 +10,6 @@ describe ChowlyHttp::Client do
       it 'sets ssl verification false' do
         expect(connection.ssl.verify).to eq(false)
       end
-
-      it 'sets parameter encoder to default' do
-        expect(connection.options.params_encoder).to eq(ChowlyHttp::UnorderedEncoder)
-      end
     end
 
     describe 'send function' do

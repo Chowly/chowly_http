@@ -28,9 +28,8 @@ Gem::Specification.new do |spec|
   spec.add_dependency 'chow-call'
 
   spec.add_dependency 'ethon', '0.13.0'
-  spec.add_dependency 'faraday', '~> 1.5.1'
-  spec.add_dependency 'faraday_middleware'
-  spec.add_dependency 'typhoeus', '~> 1.4'
+  spec.add_dependency 'activesupport', '> 6.0'
+  spec.add_dependency 'faraday-follow_redirects', '0.3.0'
 
   spec.add_development_dependency 'bundler'
   spec.add_development_dependency 'guard'
