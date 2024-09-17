@@ -27,7 +27,7 @@ Gem::Specification.new do |spec|
 
   spec.add_dependency 'chow-call'
 
-  spec.add_dependency 'ethon', '0.13.0'
+  spec.add_dependency 'ethon'
   spec.add_dependency 'activesupport', '> 6.0'
   spec.add_dependency 'faraday-follow_redirects', '0.3.0'
 
