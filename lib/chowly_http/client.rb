@@ -11,6 +11,13 @@ module ChowlyHttp
     attr_accessor :http_clients, :base_url, :app, :timeout, :open_timeout, :quick, :debug, :common_headers,
                   :verify_ssl, :follow_redirects, :raw, :proxy, :http_version, :logger, :param_encoder
 
+    REDACTED = '[REDACTED]'
+
+    # Header names whose values must never be logged in plaintext. Covers the
+    # explicit list (Authorization, Api-Key, X-Api-Key, Cookie) plus Set-Cookie
+    # and any header whose name contains "token" or "key".
+    SENSITIVE_HEADER_PATTERN = /authorization|cookie|token|key/i
+
     #
     # initialize - Make an new instance of the client
     #
@@ -36,7 +43,7 @@ module ChowlyHttp
       self.proxy = proxy
       self.param_encoder = param_encoder
       self.raw = raw
-      self.logger = Logger.new(STDOUT)
+      self.logger = logger || Logger.new(STDOUT)
     end
 
     #
@@ -75,9 +82,9 @@ module ChowlyHttp
 
       external_request_id = SecureRandom.hex(4) # Jack: Used to group logs later when searching.
       logger.info(tags: ["ExtReqID=#{external_request_id}", 'STARTED'], message: "#{method.upcase} \"#{full_url}\"")
-      logger.info(tags: ["ExtReqID=#{external_request_id}", 'HEADERS'], message: headers || {})
-      logger.info(tags: ["ExtReqID=#{external_request_id}", 'PROXY'], message: proxy || 'nil')
-      logger.info(tags: ["ExtReqID=#{external_request_id}", 'BODY'], message: body)
+      logger.info(tags: ["ExtReqID=#{external_request_id}", 'HEADERS'], message: redact_headers(headers))
+      logger.info(tags: ["ExtReqID=#{external_request_id}", 'PROXY'], message: sanitize_proxy(proxy))
+      logger.info(tags: ["ExtReqID=#{external_request_id}", 'BODY'], message: body) if debug
       external_request_start_time = Time.now
 
       begin
@@ -93,8 +100,8 @@ module ChowlyHttp
                end
 
         logger.info(tags: ["ExtReqID=#{external_request_id}", 'COMPLETED'], message: "#{resp.status} #{resp.reason_phrase} in #{Time.now - external_request_start_time}ms")
-        logger.info(tags: ["ExtReqID=#{external_request_id}", 'RESP BODY'], message: resp.body)
-        logger.info(tags: ["ExtReqID=#{external_request_id}", 'RESP HEADERS'], message: resp.headers)
+        logger.info(tags: ["ExtReqID=#{external_request_id}", 'RESP BODY'], message: resp.body) if debug
+        logger.info(tags: ["ExtReqID=#{external_request_id}", 'RESP HEADERS'], message: redact_headers(resp.headers))
         return resp.body if quick
         resp
       rescue Faraday::ServerError => e
@@ -113,8 +120,8 @@ module ChowlyHttp
         raise ChowlyHttp::Errors::TimeoutError, 'Connection Timed Out.'
       rescue Faraday::ClientError => e
         logger.info(tags: ["ExtReqID=#{external_request_id}", 'COMPLETED'], message: "#{e.response[:status]} in #{Time.now - external_request_start_time}ms")
-        logger.info(tags: ["ExtReqID=#{external_request_id}", 'RESP BODY'], message: e.response[:body])
-        logger.info(tags: ["ExtReqID=#{external_request_id}", 'RESP HEADERS'], message: e.response[:headers])
+        logger.info(tags: ["ExtReqID=#{external_request_id}", 'RESP BODY'], message: e.response[:body]) if debug
+        logger.info(tags: ["ExtReqID=#{external_request_id}", 'RESP HEADERS'], message: redact_headers(e.response[:headers]))
         logger.info(tags: ["ExtReqID=#{external_request_id}", 'ERROR MESSAGE'], message: e.message)
         resp_err = ChowlyHttp::Errors::ResponseCodeError.new(e)
         ChowlyHttp::Exceptions.raise_error(resp_err)
@@ -244,6 +251,43 @@ module ChowlyHttp
         domain = "#{uri.scheme}://#{uri.host}#{port}/"
         path   = url.sub(domain, '')
         [domain, path]
+      end
+
+      #
+      # redact_headers - Return a copy of the headers with the value of any
+      # sensitive header (see SENSITIVE_HEADER_PATTERN) replaced by REDACTED,
+      # so credentials never reach the log store.
+      #
+      # @param [Hash, Faraday::Utils::Headers] headers
+      #
+      # @return [Hash] a copy with sensitive values redacted
+      #
+      def redact_headers(headers)
+        return headers unless headers.respond_to?(:each)
+
+        headers.each_with_object({}) do |(name, value), redacted|
+          redacted[name] = sensitive_header?(name) ? REDACTED : value
+        end
+      end
+
+      def sensitive_header?(name)
+        SENSITIVE_HEADER_PATTERN.match?(name.to_s)
+      end
+
+      #
+      # sanitize_proxy - Strip any inline credentials (user:pass@) from a proxy
+      # before logging. Bright Data and other authenticated proxies carry their
+      # credentials in the proxy URL's userinfo.
+      #
+      # @param [String, Faraday::ProxyOptions, nil] proxy
+      #
+      # @return [String] a loggable proxy string with credentials removed
+      #
+      def sanitize_proxy(proxy)
+        return 'nil' if proxy.nil?
+
+        proxy_str = proxy.respond_to?(:uri) ? proxy.uri.to_s : proxy.to_s
+        proxy_str.sub(%r{://[^/@\s]+@}, "://#{REDACTED}@")
       end
 
   end
