@@ -13,10 +13,13 @@ module ChowlyHttp
 
     REDACTED = '[REDACTED]'
 
-    # Header names whose values must never be logged in plaintext. Covers the
-    # explicit list (Authorization, Api-Key, X-Api-Key, Cookie) plus Set-Cookie
-    # and any header whose name contains "token" or "key".
-    SENSITIVE_HEADER_PATTERN = /authorization|cookie|token|key/i
+    # Header names whose values must never be logged in plaintext. "auth" covers
+    # Authorization, Proxy-Authorization, MxAuthorization, X-Auth-* and Revel's
+    # API-AUTHENTICATION (key:secret); "password" covers Breadcrumb's
+    # X-Breadcrumb-Password; the rest cover Cookie/Set-Cookie plus bearer/API
+    # tokens and keys. Deliberately leaves non-secret headers such as
+    # x-brd-error-code visible — Datadog monitor 328681408 reads it off the logs.
+    SENSITIVE_HEADER_PATTERN = /auth|cookie|token|key|secret|password/i
 
     #
     # initialize - Make an new instance of the client
@@ -216,7 +219,13 @@ module ChowlyHttp
           conn.response :json, content_type: /\bjson(Camel)?/ unless self.raw
           conn.response :raise_error
           conn.response :follow_redirects, limit: 3, standards_compliant: true if follow_redirects
-          conn.response :logger, ::Logger.new(STDOUT), bodies: true if self.debug
+          if self.debug
+            conn.response :logger, ::Logger.new(STDOUT), bodies: true do |log|
+              # Faraday's own logger dumps every request/response header to STDOUT,
+              # so it needs the same credential redaction as redact_headers above.
+              log.filter(/^([^:\n]*(?:#{SENSITIVE_HEADER_PATTERN.source})[^:\n]*: ).*$/i, '\1"[REDACTED]"')
+            end
+          end
           conn.proxy = Faraday::ProxyOptions.from(proxy) if proxy.present?
           conn.options.params_encoder = self.param_encoder if self.param_encoder.present?
           conn.adapter :typhoeus, http_version: self.http_version if self.http_version.present?

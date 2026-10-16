@@ -182,27 +182,38 @@ describe ChowlyHttp::Client do
         let(:headers) do
           {
             'Authorization' => 'Bearer super-secret',
+            'Proxy-Authorization' => 'Basic super-secret',
+            'MxAuthorization' => 'mx-secret',
+            'X-Auth-Token' => 'x-auth-secret',
+            'API-AUTHENTICATION' => 'revel-key:revel-secret',
+            'X-Breadcrumb-Password' => 'breadcrumb-secret',
             'Api-Key' => 'api-secret',
             'X-Api-Key' => 'x-api-secret',
             'Cookie' => 'session=abc',
             'Set-Cookie' => 'session=abc',
             'X-Request-Token' => 'token-secret',
             'Content-Type' => 'application/json',
-            'X-Trace-Id' => 'trace-123'
+            'X-Trace-Id' => 'trace-123',
+            'x-brd-error-code' => 'MENU_SYNC_FAILED'
           }
         end
 
         let(:redacted) { subject.send(:redact_headers, headers) }
 
         it 'redacts every sensitive header', :aggregate_failures do
-          %w[Authorization Api-Key X-Api-Key Cookie Set-Cookie X-Request-Token].each do |name|
+          %w[
+            Authorization Proxy-Authorization MxAuthorization X-Auth-Token
+            API-AUTHENTICATION X-Breadcrumb-Password Api-Key X-Api-Key
+            Cookie Set-Cookie X-Request-Token
+          ].each do |name|
             expect(redacted[name]).to eq('[REDACTED]')
           end
         end
 
-        it 'preserves non-sensitive headers', :aggregate_failures do
+        it 'preserves non-sensitive headers, including x-brd-error-code for Datadog monitor 328681408', :aggregate_failures do
           expect(redacted['Content-Type']).to eq('application/json')
           expect(redacted['X-Trace-Id']).to eq('trace-123')
+          expect(redacted['x-brd-error-code']).to eq('MENU_SYNC_FAILED')
         end
 
         it 'never leaks a secret value anywhere in the result' do
@@ -298,6 +309,25 @@ describe ChowlyHttp::Client do
           it 'opts back into request and response body logging', :aggregate_failures do
             expect(logged_tags).to include('BODY')
             expect(logged_tags).to include('RESP BODY')
+          end
+        end
+
+        context "with debug enabled, Faraday's own logger must not leak credentials to STDOUT" do
+          let(:captured_stdout) { StringIO.new }
+          let(:client) { described_class.new(logger: recording_logger, debug: true) }
+
+          before do
+            stub_const('STDOUT', captured_stdout)
+            client.get(
+              url: 'https://test/example.json',
+              headers: { 'Authorization' => 'Bearer faraday-leak-canary' }
+            )
+          end
+
+          it 'redacts the bearer on the Faraday header dump line', :aggregate_failures do
+            output = captured_stdout.string
+            expect(output).not_to include('faraday-leak-canary')
+            expect(output).to include('[REDACTED]')
           end
         end
       end
