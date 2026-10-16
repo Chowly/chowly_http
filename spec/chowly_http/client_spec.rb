@@ -331,6 +331,43 @@ describe ChowlyHttp::Client do
           end
         end
       end
+
+      describe 'raised errors never carry credentials' do
+        let(:null_logger) do
+          Class.new do
+            def info(*args, **kwargs); end
+
+            def method_missing(*); end
+
+            def respond_to_missing?(*)
+              true
+            end
+          end.new
+        end
+
+        subject { described_class.new(logger: null_logger) }
+
+        def error_from(url)
+          subject.get(url: url, headers: { 'Authorization' => 'Bearer error-leak-canary' })
+          nil
+        rescue ChowlyHttp::Errors::ResponseCodeError => e
+          e
+        end
+
+        it 'redacts the request Authorization on a 4xx error (ClientError path)', :aggregate_failures do
+          err = error_from('https://fail/401')
+          expect(err).to be_a(ChowlyHttp::Unauthorized)
+          expect(err.response[:request][:headers]['Authorization']).to eq('[REDACTED]')
+          expect(err.response[:request][:headers].to_s).not_to include('error-leak-canary')
+        end
+
+        it 'redacts the request Authorization on a 5xx error (ServerError path)', :aggregate_failures do
+          err = error_from('https://fail/500')
+          expect(err).to be_a(ChowlyHttp::InternalServerError)
+          expect(err.response[:request][:headers]['Authorization']).to eq('[REDACTED]')
+          expect(err.response[:request][:headers].to_s).not_to include('error-leak-canary')
+        end
+      end
     end
   end
 end

@@ -109,7 +109,7 @@ module ChowlyHttp
         resp
       rescue Faraday::ServerError => e
         resp_err          = ChowlyHttp::Errors::ResponseCodeError.new(e.message)
-        resp_err.response = e.response
+        resp_err.response = redact_error_response(e.response)
         ChowlyHttp::Exceptions.raise_error(resp_err)
       rescue Faraday::ConnectionFailed => e
         resp_err          = ChowlyHttp::Errors::ResponseCodeError.new(e.message)
@@ -127,6 +127,7 @@ module ChowlyHttp
         logger.info(tags: ["ExtReqID=#{external_request_id}", 'RESP HEADERS'], message: redact_headers(e.response[:headers]))
         logger.info(tags: ["ExtReqID=#{external_request_id}", 'ERROR MESSAGE'], message: e.message)
         resp_err = ChowlyHttp::Errors::ResponseCodeError.new(e)
+        resp_err.response = redact_error_response(resp_err.response)
         ChowlyHttp::Exceptions.raise_error(resp_err)
       end
     end
@@ -281,6 +282,30 @@ module ChowlyHttp
 
       def sensitive_header?(name)
         SENSITIVE_HEADER_PATTERN.match?(name.to_s)
+      end
+
+      #
+      # redact_error_response - Faraday's ClientError/ServerError payload carries
+      # both the response headers and the original request headers, so a consumer
+      # that ships the raised error to Sentry or logs e.inspect would leak the
+      # credentials this class otherwise redacts. Scrub both header sets before
+      # the error leaves the client, without disturbing status/body.
+      #
+      # @param [Hash] response a Faraday error response hash
+      #
+      # @return [Hash] a copy with request and response headers redacted
+      #
+      def redact_error_response(response)
+        return response unless response.is_a?(Hash)
+
+        redacted = response.dup
+        redacted[:headers] = redact_headers(response[:headers]) if response.key?(:headers)
+        if response[:request].is_a?(Hash)
+          redacted[:request] = response[:request].merge(
+            headers: redact_headers(response[:request][:headers])
+          )
+        end
+        redacted
       end
 
       #
