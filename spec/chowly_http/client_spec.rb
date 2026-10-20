@@ -174,5 +174,200 @@ describe ChowlyHttp::Client do
         expect(resp.body['resp']).to eq 'POST OK'
       end
     end
+
+    describe 'sensitive data redaction (TEAM-14890)' do
+      describe '#redact_headers' do
+        subject { described_class.new }
+
+        let(:headers) do
+          {
+            'Authorization' => 'Bearer super-secret',
+            'Proxy-Authorization' => 'Basic super-secret',
+            'MxAuthorization' => 'mx-secret',
+            'X-Auth-Token' => 'x-auth-secret',
+            'API-AUTHENTICATION' => 'revel-key:revel-secret',
+            'X-Breadcrumb-Password' => 'breadcrumb-secret',
+            'Api-Key' => 'api-secret',
+            'X-Api-Key' => 'x-api-secret',
+            'Cookie' => 'session=abc',
+            'Set-Cookie' => 'session=abc',
+            'X-Request-Token' => 'token-secret',
+            'Content-Type' => 'application/json',
+            'X-Trace-Id' => 'trace-123',
+            'x-brd-error-code' => 'MENU_SYNC_FAILED'
+          }
+        end
+
+        let(:redacted) { subject.send(:redact_headers, headers) }
+
+        it 'redacts every sensitive header', :aggregate_failures do
+          %w[
+            Authorization Proxy-Authorization MxAuthorization X-Auth-Token
+            API-AUTHENTICATION X-Breadcrumb-Password Api-Key X-Api-Key
+            Cookie Set-Cookie X-Request-Token
+          ].each do |name|
+            expect(redacted[name]).to eq('[REDACTED]')
+          end
+        end
+
+        it 'preserves non-sensitive headers, including x-brd-error-code for Datadog monitor 328681408', :aggregate_failures do
+          expect(redacted['Content-Type']).to eq('application/json')
+          expect(redacted['X-Trace-Id']).to eq('trace-123')
+          expect(redacted['x-brd-error-code']).to eq('MENU_SYNC_FAILED')
+        end
+
+        it 'never leaks a secret value anywhere in the result' do
+          expect(redacted.values.join(' ')).not_to include('secret')
+        end
+
+        it 'is resilient to a nil headers payload' do
+          expect(subject.send(:redact_headers, nil)).to be_nil
+        end
+      end
+
+      describe '#sanitize_proxy' do
+        subject { described_class.new }
+
+        it 'strips inline credentials from a proxy url' do
+          expect(subject.send(:sanitize_proxy, 'http://brd-customer-x:PASSWORD@brd.superproxy.io:22225'))
+            .to eq('http://[REDACTED]@brd.superproxy.io:22225')
+        end
+
+        it 'leaves a credential-free proxy url unchanged' do
+          expect(subject.send(:sanitize_proxy, 'http://brd.superproxy.io:22225'))
+            .to eq('http://brd.superproxy.io:22225')
+        end
+
+        it 'returns the nil placeholder when there is no proxy' do
+          expect(subject.send(:sanitize_proxy, nil)).to eq('nil')
+        end
+      end
+
+      describe 'logging through a real request' do
+        let(:log_entries) { [] }
+
+        let(:recording_logger) do
+          Class.new do
+            def initialize(sink)
+              @sink = sink
+            end
+
+            def info(*args, **kwargs)
+              @sink << (kwargs.empty? ? { message: args.first } : kwargs)
+            end
+
+            def method_missing(*); end
+
+            def respond_to_missing?(*)
+              true
+            end
+          end.new(log_entries)
+        end
+
+        let(:logged_tags) { log_entries.flat_map { |e| e[:tags] || [] } }
+
+        def message_for(tag)
+          entry = log_entries.find { |e| (e[:tags] || []).include?(tag) }
+          entry && entry[:message]
+        end
+
+        context 'with debug disabled (default)' do
+          let(:client) { described_class.new(logger: recording_logger) }
+
+          before do
+            client.get(
+              url: 'https://test/example.json',
+              headers: { 'Authorization' => 'Bearer secret-token', 'X-Api-Key' => 'api-secret' }
+            )
+          end
+
+          it 'redacts sensitive request headers before logging', :aggregate_failures do
+            headers = message_for('HEADERS')
+            expect(headers['Authorization']).to eq('[REDACTED]')
+            expect(headers['X-Api-Key']).to eq('[REDACTED]')
+            expect(headers['Content-Type']).to eq('application/json')
+          end
+
+          it 'does not log the request body at INFO' do
+            expect(logged_tags).not_to include('BODY')
+          end
+
+          it 'does not log the response body at INFO' do
+            expect(logged_tags).not_to include('RESP BODY')
+          end
+
+          it 'still logs the (redacted) response headers' do
+            expect(logged_tags).to include('RESP HEADERS')
+          end
+        end
+
+        context 'with debug enabled' do
+          let(:client) { described_class.new(logger: recording_logger, debug: true) }
+
+          before { client.get(url: 'https://test/example.json') }
+
+          it 'opts back into request and response body logging', :aggregate_failures do
+            expect(logged_tags).to include('BODY')
+            expect(logged_tags).to include('RESP BODY')
+          end
+        end
+
+        context "with debug enabled, Faraday's own logger must not leak credentials to STDOUT" do
+          let(:captured_stdout) { StringIO.new }
+          let(:client) { described_class.new(logger: recording_logger, debug: true) }
+
+          before do
+            stub_const('STDOUT', captured_stdout)
+            client.get(
+              url: 'https://test/example.json',
+              headers: { 'Authorization' => 'Bearer faraday-leak-canary' }
+            )
+          end
+
+          it 'redacts the bearer on the Faraday header dump line', :aggregate_failures do
+            output = captured_stdout.string
+            expect(output).not_to include('faraday-leak-canary')
+            expect(output).to include('[REDACTED]')
+          end
+        end
+      end
+
+      describe 'raised errors never carry credentials' do
+        let(:null_logger) do
+          Class.new do
+            def info(*args, **kwargs); end
+
+            def method_missing(*); end
+
+            def respond_to_missing?(*)
+              true
+            end
+          end.new
+        end
+
+        subject { described_class.new(logger: null_logger) }
+
+        def error_from(url)
+          subject.get(url: url, headers: { 'Authorization' => 'Bearer error-leak-canary' })
+          nil
+        rescue ChowlyHttp::Errors::ResponseCodeError => e
+          e
+        end
+
+        it 'redacts the request Authorization on a 4xx error (ClientError path)', :aggregate_failures do
+          err = error_from('https://fail/401')
+          expect(err).to be_a(ChowlyHttp::Unauthorized)
+          expect(err.response[:request][:headers]['Authorization']).to eq('[REDACTED]')
+          expect(err.response[:request][:headers].to_s).not_to include('error-leak-canary')
+        end
+
+        it 'redacts the request Authorization on a 5xx error (ServerError path)', :aggregate_failures do
+          err = error_from('https://fail/500')
+          expect(err).to be_a(ChowlyHttp::InternalServerError)
+          expect(err.response[:request][:headers]['Authorization']).to eq('[REDACTED]')
+          expect(err.response[:request][:headers].to_s).not_to include('error-leak-canary')
+        end
+      end
+    end
   end
 end

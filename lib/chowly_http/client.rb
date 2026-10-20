@@ -11,6 +11,16 @@ module ChowlyHttp
     attr_accessor :http_clients, :base_url, :app, :timeout, :open_timeout, :quick, :debug, :common_headers,
                   :verify_ssl, :follow_redirects, :raw, :proxy, :http_version, :logger, :param_encoder
 
+    REDACTED = '[REDACTED]'
+
+    # Header names whose values must never be logged in plaintext. "auth" covers
+    # Authorization, Proxy-Authorization, MxAuthorization, X-Auth-* and Revel's
+    # API-AUTHENTICATION (key:secret); "password" covers Breadcrumb's
+    # X-Breadcrumb-Password; the rest cover Cookie/Set-Cookie plus bearer/API
+    # tokens and keys. Deliberately leaves non-secret headers such as
+    # x-brd-error-code visible — Datadog monitor 328681408 reads it off the logs.
+    SENSITIVE_HEADER_PATTERN = /auth|cookie|token|key|secret|password/i
+
     #
     # initialize - Make an new instance of the client
     #
@@ -36,7 +46,7 @@ module ChowlyHttp
       self.proxy = proxy
       self.param_encoder = param_encoder
       self.raw = raw
-      self.logger = Logger.new(STDOUT)
+      self.logger = logger || Logger.new(STDOUT)
     end
 
     #
@@ -75,9 +85,9 @@ module ChowlyHttp
 
       external_request_id = SecureRandom.hex(4) # Jack: Used to group logs later when searching.
       logger.info(tags: ["ExtReqID=#{external_request_id}", 'STARTED'], message: "#{method.upcase} \"#{full_url}\"")
-      logger.info(tags: ["ExtReqID=#{external_request_id}", 'HEADERS'], message: headers || {})
-      logger.info(tags: ["ExtReqID=#{external_request_id}", 'PROXY'], message: proxy || 'nil')
-      logger.info(tags: ["ExtReqID=#{external_request_id}", 'BODY'], message: body)
+      logger.info(tags: ["ExtReqID=#{external_request_id}", 'HEADERS'], message: redact_headers(headers))
+      logger.info(tags: ["ExtReqID=#{external_request_id}", 'PROXY'], message: sanitize_proxy(proxy))
+      logger.info(tags: ["ExtReqID=#{external_request_id}", 'BODY'], message: body) if debug
       external_request_start_time = Time.now
 
       begin
@@ -93,13 +103,13 @@ module ChowlyHttp
                end
 
         logger.info(tags: ["ExtReqID=#{external_request_id}", 'COMPLETED'], message: "#{resp.status} #{resp.reason_phrase} in #{Time.now - external_request_start_time}ms")
-        logger.info(tags: ["ExtReqID=#{external_request_id}", 'RESP BODY'], message: resp.body)
-        logger.info(tags: ["ExtReqID=#{external_request_id}", 'RESP HEADERS'], message: resp.headers)
+        logger.info(tags: ["ExtReqID=#{external_request_id}", 'RESP BODY'], message: resp.body) if debug
+        logger.info(tags: ["ExtReqID=#{external_request_id}", 'RESP HEADERS'], message: redact_headers(resp.headers))
         return resp.body if quick
         resp
       rescue Faraday::ServerError => e
         resp_err          = ChowlyHttp::Errors::ResponseCodeError.new(e.message)
-        resp_err.response = e.response
+        resp_err.response = redact_error_response(e.response)
         ChowlyHttp::Exceptions.raise_error(resp_err)
       rescue Faraday::ConnectionFailed => e
         resp_err          = ChowlyHttp::Errors::ResponseCodeError.new(e.message)
@@ -113,10 +123,11 @@ module ChowlyHttp
         raise ChowlyHttp::Errors::TimeoutError, 'Connection Timed Out.'
       rescue Faraday::ClientError => e
         logger.info(tags: ["ExtReqID=#{external_request_id}", 'COMPLETED'], message: "#{e.response[:status]} in #{Time.now - external_request_start_time}ms")
-        logger.info(tags: ["ExtReqID=#{external_request_id}", 'RESP BODY'], message: e.response[:body])
-        logger.info(tags: ["ExtReqID=#{external_request_id}", 'RESP HEADERS'], message: e.response[:headers])
+        logger.info(tags: ["ExtReqID=#{external_request_id}", 'RESP BODY'], message: e.response[:body]) if debug
+        logger.info(tags: ["ExtReqID=#{external_request_id}", 'RESP HEADERS'], message: redact_headers(e.response[:headers]))
         logger.info(tags: ["ExtReqID=#{external_request_id}", 'ERROR MESSAGE'], message: e.message)
         resp_err = ChowlyHttp::Errors::ResponseCodeError.new(e)
+        resp_err.response = redact_error_response(resp_err.response)
         ChowlyHttp::Exceptions.raise_error(resp_err)
       end
     end
@@ -209,7 +220,13 @@ module ChowlyHttp
           conn.response :json, content_type: /\bjson(Camel)?/ unless self.raw
           conn.response :raise_error
           conn.response :follow_redirects, limit: 3, standards_compliant: true if follow_redirects
-          conn.response :logger, ::Logger.new(STDOUT), bodies: true if self.debug
+          if self.debug
+            conn.response :logger, ::Logger.new(STDOUT), bodies: true do |log|
+              # Faraday's own logger dumps every request/response header to STDOUT,
+              # so it needs the same credential redaction as redact_headers above.
+              log.filter(/^([^:\n]*(?:#{SENSITIVE_HEADER_PATTERN.source})[^:\n]*: ).*$/i, '\1"[REDACTED]"')
+            end
+          end
           conn.proxy = Faraday::ProxyOptions.from(proxy) if proxy.present?
           conn.options.params_encoder = self.param_encoder if self.param_encoder.present?
           conn.adapter :typhoeus, http_version: self.http_version if self.http_version.present?
@@ -244,6 +261,67 @@ module ChowlyHttp
         domain = "#{uri.scheme}://#{uri.host}#{port}/"
         path   = url.sub(domain, '')
         [domain, path]
+      end
+
+      #
+      # redact_headers - Return a copy of the headers with the value of any
+      # sensitive header (see SENSITIVE_HEADER_PATTERN) replaced by REDACTED,
+      # so credentials never reach the log store.
+      #
+      # @param [Hash, Faraday::Utils::Headers] headers
+      #
+      # @return [Hash] a copy with sensitive values redacted
+      #
+      def redact_headers(headers)
+        return headers unless headers.respond_to?(:each)
+
+        headers.each_with_object({}) do |(name, value), redacted|
+          redacted[name] = sensitive_header?(name) ? REDACTED : value
+        end
+      end
+
+      def sensitive_header?(name)
+        SENSITIVE_HEADER_PATTERN.match?(name.to_s)
+      end
+
+      #
+      # redact_error_response - Faraday's ClientError/ServerError payload carries
+      # both the response headers and the original request headers, so a consumer
+      # that ships the raised error to Sentry or logs e.inspect would leak the
+      # credentials this class otherwise redacts. Scrub both header sets before
+      # the error leaves the client, without disturbing status/body.
+      #
+      # @param [Hash] response a Faraday error response hash
+      #
+      # @return [Hash] a copy with request and response headers redacted
+      #
+      def redact_error_response(response)
+        return response unless response.is_a?(Hash)
+
+        redacted = response.dup
+        redacted[:headers] = redact_headers(response[:headers]) if response.key?(:headers)
+        if response[:request].is_a?(Hash)
+          redacted[:request] = response[:request].merge(
+            headers: redact_headers(response[:request][:headers])
+          )
+        end
+        redacted
+      end
+
+      #
+      # sanitize_proxy - Strip any inline credentials (user:pass@) from a proxy
+      # before logging. Bright Data and other authenticated proxies carry their
+      # credentials in the proxy URL's userinfo.
+      #
+      # @param [String, Faraday::ProxyOptions, nil] proxy
+      #
+      # @return [String] a loggable proxy string with credentials removed
+      #
+      def sanitize_proxy(proxy)
+        return 'nil' if proxy.nil?
+
+        proxy_str = proxy.respond_to?(:uri) ? proxy.uri.to_s : proxy.to_s
+        proxy_str.sub(%r{://[^/@\s]+@}, "://#{REDACTED}@")
       end
 
   end
