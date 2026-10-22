@@ -268,16 +268,23 @@ module ChowlyHttp
       # sensitive header (see SENSITIVE_HEADER_PATTERN) replaced by REDACTED,
       # so credentials never reach the log store.
       #
+      # The copy keeps the input's type. Faraday hands response and request
+      # headers over as Faraday::Utils::Headers, a case-insensitive Hash, and
+      # callers read them that way off a raised error: Toast sends `retry-after`
+      # in lowercase and its clients read e.headers['Retry-After']. A plain-Hash
+      # copy turns that lookup into nil, so a 429 retries without waiting.
+      #
       # @param [Hash, Faraday::Utils::Headers] headers
       #
-      # @return [Hash] a copy with sensitive values redacted
+      # @return [Hash, Faraday::Utils::Headers] a copy of the same type with
+      #   sensitive values redacted
       #
       def redact_headers(headers)
         return headers unless headers.respond_to?(:each)
 
-        headers.each_with_object({}) do |(name, value), redacted|
-          redacted[name] = sensitive_header?(name) ? REDACTED : value
-        end
+        redacted = headers.is_a?(Faraday::Utils::Headers) ? Faraday::Utils::Headers.new : {}
+        headers.each { |name, value| redacted[name] = sensitive_header?(name) ? REDACTED : value }
+        redacted
       end
 
       def sensitive_header?(name)
@@ -289,7 +296,8 @@ module ChowlyHttp
       # both the response headers and the original request headers, so a consumer
       # that ships the raised error to Sentry or logs e.inspect would leak the
       # credentials this class otherwise redacts. Scrub both header sets before
-      # the error leaves the client, without disturbing status/body.
+      # the error leaves the client, without disturbing status/body or the
+      # headers' case-insensitive lookup (see redact_headers).
       #
       # @param [Hash] response a Faraday error response hash
       #
