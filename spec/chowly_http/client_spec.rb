@@ -223,6 +223,39 @@ describe ChowlyHttp::Client do
         it 'is resilient to a nil headers payload' do
           expect(subject.send(:redact_headers, nil)).to be_nil
         end
+
+        context "with Faraday's case-insensitive headers, as a response carries them" do
+          let(:faraday_headers) do
+            Faraday::Utils::Headers.new.tap do |h|
+              h.parse("HTTP/1.1 429 Too Many Requests\r\nretry-after: 7\r\nset-cookie: session=abc\r\n")
+            end
+          end
+
+          let(:redacted) { subject.send(:redact_headers, faraday_headers) }
+
+          it 'returns the same case-insensitive type, so a title-cased lookup still finds a lowercase header', :aggregate_failures do
+            expect(redacted).to be_a(Faraday::Utils::Headers)
+            # The stored name stays exactly what the server sent; the lookup is what is case-insensitive.
+            expect(redacted.keys).to include('retry-after')
+            expect(redacted['Retry-After']).to eq('7')
+            expect(redacted.fetch('RETRY-AFTER')).to eq('7')
+          end
+
+          it 'still redacts sensitive values, under any spelling of the name', :aggregate_failures do
+            expect(redacted['Set-Cookie']).to eq('[REDACTED]')
+            expect(redacted['set-cookie']).to eq('[REDACTED]')
+            expect(redacted.values.join(' ')).not_to include('session=abc')
+          end
+
+          it 'does not modify the headers it was given' do
+            redacted
+            expect(faraday_headers['Set-Cookie']).to eq('session=abc')
+          end
+        end
+
+        it 'returns a plain Hash for a plain Hash' do
+          expect(redacted).to be_an_instance_of(Hash)
+        end
       end
 
       describe '#sanitize_proxy' do
@@ -366,6 +399,79 @@ describe ChowlyHttp::Client do
           expect(err).to be_a(ChowlyHttp::InternalServerError)
           expect(err.response[:request][:headers]['Authorization']).to eq('[REDACTED]')
           expect(err.response[:request][:headers].to_s).not_to include('error-leak-canary')
+        end
+      end
+
+      # A raised error's headers must stay case-insensitive after redaction: Toast answers a 429 with
+      # a lowercase `retry-after`, and its clients read e.headers['Retry-After'] to know how long to
+      # wait. Driven through Faraday's test adapter rather than WebMock, because WebMock title-cases
+      # stubbed header names and would hide the bug.
+      describe 'raised errors keep case-insensitive headers' do
+        let(:null_logger) do
+          Class.new do
+            def info(*args, **kwargs); end
+
+            def method_missing(*); end
+
+            def respond_to_missing?(*)
+              true
+            end
+          end.new
+        end
+
+        let(:stubs) { Faraday::Adapter::Test::Stubs.new }
+
+        # Mirrors the middleware get_connection installs, minus the real adapter.
+        let(:connection) do
+          Faraday.new(url: 'https://toast.example.test/') do |conn|
+            conn.response :json, content_type: /\bjson(Camel)?/
+            conn.response :raise_error
+            conn.adapter :test, stubs
+          end
+        end
+
+        subject { described_class.new(logger: null_logger) }
+
+        def error_from(url)
+          subject.get(url: url, headers: { 'Authorization' => 'Bearer header-leak-canary' })
+          nil
+        rescue ChowlyHttp::Errors::ResponseCodeError => e
+          e
+        end
+
+        before { allow(subject).to receive(:get_connection).and_return(connection) }
+
+        it 'reads a lowercase retry-after off a 429 with any spelling of the name', :aggregate_failures do
+          stubs.get('/menus/v2/menus') { [429, { 'retry-after' => '7', 'set-cookie' => 'session=abc' }, 'slow down'] }
+
+          err = error_from('https://toast.example.test/menus/v2/menus')
+
+          expect(err).to be_a(ChowlyHttp::TooManyRequests)
+          # Not vacuous: the header really is stored under its lowercase name.
+          expect(err.headers.keys).to include('retry-after')
+          expect(err.headers['Retry-After']).to eq('7')
+          expect(err.headers['Set-Cookie']).to eq('[REDACTED]')
+          expect(err.headers.to_s).not_to include('session=abc')
+        end
+
+        it "keeps the request headers case-insensitive and redacted too", :aggregate_failures do
+          stubs.get('/menus/v2/menus') { [429, { 'retry-after' => '7' }, 'slow down'] }
+
+          request_headers = error_from('https://toast.example.test/menus/v2/menus').response[:request][:headers]
+
+          expect(request_headers).to be_a(Faraday::Utils::Headers)
+          expect(request_headers['authorization']).to eq('[REDACTED]')
+          expect(request_headers.to_s).not_to include('header-leak-canary')
+        end
+
+        it 'keeps them case-insensitive on a 5xx (ServerError path)', :aggregate_failures do
+          stubs.get('/menus/v2/menus') { [503, { 'retry-after' => '30' }, 'down'] }
+
+          err = error_from('https://toast.example.test/menus/v2/menus')
+
+          expect(err).to be_a(ChowlyHttp::ServiceUnavailable)
+          expect(err.headers.keys).to include('retry-after')
+          expect(err.headers['Retry-After']).to eq('30')
         end
       end
     end
