@@ -108,7 +108,7 @@ module ChowlyHttp
         return resp.body if quick
         resp
       rescue Faraday::ServerError => e
-        resp_err          = ChowlyHttp::Errors::ResponseCodeError.new(e.message)
+        resp_err          = ChowlyHttp::Errors::ResponseCodeError.new(status_error_message(e))
         resp_err.response = redact_error_response(e.response)
         ChowlyHttp::Exceptions.raise_error(resp_err)
       rescue Faraday::ConnectionFailed => e
@@ -125,7 +125,7 @@ module ChowlyHttp
         logger.info(tags: ["ExtReqID=#{external_request_id}", 'COMPLETED'], message: "#{e.response[:status]} in #{Time.now - external_request_start_time}ms")
         logger.info(tags: ["ExtReqID=#{external_request_id}", 'RESP BODY'], message: e.response[:body]) if debug
         logger.info(tags: ["ExtReqID=#{external_request_id}", 'RESP HEADERS'], message: redact_headers(e.response[:headers]))
-        logger.info(tags: ["ExtReqID=#{external_request_id}", 'ERROR MESSAGE'], message: e.message)
+        logger.info(tags: ["ExtReqID=#{external_request_id}", 'ERROR MESSAGE'], message: status_error_message(e))
         resp_err = ChowlyHttp::Errors::ResponseCodeError.new(e)
         resp_err.response = redact_error_response(resp_err.response)
         ChowlyHttp::Exceptions.raise_error(resp_err)
@@ -283,25 +283,68 @@ module ChowlyHttp
         return headers unless headers.respond_to?(:each)
 
         redacted = headers.is_a?(Faraday::Utils::Headers) ? Faraday::Utils::Headers.new : {}
-        headers.each { |name, value| redacted[name] = sensitive_header?(name) ? REDACTED : value }
+        headers.each { |name, value| redacted[name] = sensitive_name?(name) ? REDACTED : value }
         redacted
       end
 
-      def sensitive_header?(name)
+      # Header and query-param names share SENSITIVE_HEADER_PATTERN: Google Places sends key=.
+      def sensitive_name?(name)
         SENSITIVE_HEADER_PATTERN.match?(name.to_s)
+      end
+
+      #
+      # redact_url - Return the url with the value of every sensitive query
+      # param replaced by REDACTED, as the same type it came in (Faraday keeps
+      # a URI on the error's request). A query that cannot be parsed is dropped.
+      #
+      # @param [URI, String, nil] url
+      #
+      # @return [URI, String, nil]
+      #
+      def redact_url(url)
+        return url if url.nil?
+
+        uri = URI.parse(url.to_s)
+        if uri.query
+          begin
+            pairs = URI.decode_www_form(uri.query).map { |name, value| [name, sensitive_name?(name) ? REDACTED : value] }
+            uri.query = URI.encode_www_form(pairs)
+          rescue ArgumentError
+            uri.query = nil
+          end
+        end
+        url.is_a?(URI::Generic) ? uri : uri.to_s
+      rescue URI::InvalidURIError
+        REDACTED
+      end
+
+      #
+      # redact_params - Return a copy of the query params with sensitive values
+      # replaced by REDACTED.
+      #
+      # @param [Hash, nil] params
+      #
+      # @return [Hash, nil]
+      #
+      def redact_params(params)
+        return params unless params.respond_to?(:each_with_object)
+
+        params.each_with_object({}) { |(name, value), redacted| redacted[name] = sensitive_name?(name) ? REDACTED : value }
       end
 
       #
       # redact_error_response - Faraday's ClientError/ServerError payload carries
       # both the response headers and the original request headers, so a consumer
       # that ships the raised error to Sentry or logs e.inspect would leak the
-      # credentials this class otherwise redacts. Scrub both header sets before
-      # the error leaves the client, without disturbing status/body or the
+      # credentials this class otherwise redacts. Scrub both header sets, and
+      # sensitive query params in the request's url and params, before the
+      # error leaves the client, without disturbing status/body or the
       # headers' case-insensitive lookup (see redact_headers).
       #
       # @param [Hash] response a Faraday error response hash
       #
-      # @return [Hash] a copy with request and response headers redacted
+      # @return [Hash] a copy with request and response headers and sensitive
+      #   request query params redacted
       #
       def redact_error_response(response)
         return response unless response.is_a?(Hash)
@@ -309,11 +352,28 @@ module ChowlyHttp
         redacted = response.dup
         redacted[:headers] = redact_headers(response[:headers]) if response.key?(:headers)
         if response[:request].is_a?(Hash)
-          redacted[:request] = response[:request].merge(
-            headers: redact_headers(response[:request][:headers])
-          )
+          request = response[:request].merge(headers: redact_headers(response[:request][:headers]))
+          request[:url] = redact_url(request[:url]) if request.key?(:url)
+          request[:params] = redact_params(request[:params]) if request.key?(:params)
+          redacted[:request] = request
         end
         redacted
+      end
+
+      #
+      # status_error_message - The message for a 4xx/5xx, built from the status
+      # alone. From Faraday 2.14 the error's own message appends
+      # "for <METHOD> <url>", and a URL can carry a credential in its query
+      # (Google Places sends key=). This keeps Faraday 2.9's wording, so the
+      # message never holds the URL and stays one string per status for error
+      # grouping, whichever Faraday version is installed.
+      #
+      # @param [Faraday::Error] error
+      #
+      # @return [String]
+      #
+      def status_error_message(error)
+        "the server responded with status #{error.response_status}"
       end
 
       #

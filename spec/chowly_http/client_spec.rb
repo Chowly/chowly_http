@@ -402,6 +402,78 @@ describe ChowlyHttp::Client do
         end
       end
 
+      # chowly-api#3636: from Faraday 2.14 the error message appends "for <METHOD> <url>", and some
+      # integrations (Google Places) send their key in the URL's query.
+      describe 'error messages never carry the request URL' do
+        let(:log_entries) { [] }
+
+        let(:recording_logger) do
+          Class.new do
+            def initialize(sink)
+              @sink = sink
+            end
+
+            def info(*args, **kwargs)
+              @sink << (kwargs.empty? ? { message: args.first } : kwargs)
+            end
+
+            def method_missing(*); end
+
+            def respond_to_missing?(*)
+              true
+            end
+          end.new(log_entries)
+        end
+
+        subject { described_class.new(logger: recording_logger) }
+
+        def error_from(url)
+          subject.get(url: url)
+          nil
+        rescue ChowlyHttp::Errors::ResponseCodeError => e
+          e
+        end
+
+        def error_message_log
+          log_entries.find { |e| (e[:tags] || []).include?('ERROR MESSAGE') }&.fetch(:message)
+        end
+
+        # A mapped status (500-511) is re-wrapped by Exceptions.raise_error, which keeps only the
+        # response, so the status message survives only for an unmapped 5xx such as Cloudflare's 520.
+        it 'keeps the URL and its query out of an unmapped 5xx message (ServerError path)', :aggregate_failures do
+          err = error_from('https://fail/520?key=url-leak-secret')
+          expect(err.message).not_to include('url-leak-secret')
+          expect(err.message).to eq('the server responded with status 520 | Error 520')
+        end
+
+        it 'keeps the URL and its query out of a mapped 5xx message', :aggregate_failures do
+          err = error_from('https://fail/503?key=url-leak-secret')
+          expect(err).to be_a(ChowlyHttp::ServiceUnavailable)
+          expect(err.message).to eq('Error 503')
+        end
+
+        it 'keeps the URL and its query out of the logged 4xx message (ClientError path)', :aggregate_failures do
+          err = error_from('https://fail/404?key=url-leak-secret')
+          expect(err).to be_a(ChowlyHttp::NotFound)
+          expect(err.message).not_to include('url-leak-secret')
+          expect(error_message_log).to eq('the server responded with status 404')
+        end
+
+        it "redacts a sensitive query param in the raised error's request url and params", :aggregate_failures do
+          err = error_from('https://fail/404?key=url-leak-secret&page=2')
+          request = err.response[:request]
+          expect(err.response.inspect).not_to include('url-leak-secret')
+          expect(request[:url]).to be_a(URI::Generic)
+          expect(request[:url].to_s).to eq('https://fail/404?key=%5BREDACTED%5D&page=2')
+          expect(request[:params]).to eq('key' => '[REDACTED]', 'page' => '2')
+        end
+
+        it 'redacts it on an unmapped 5xx too (ServerError path)' do
+          err = error_from('https://fail/520?key=url-leak-secret')
+          expect(err.response.inspect).not_to include('url-leak-secret')
+        end
+      end
+
       # A raised error's headers must stay case-insensitive after redaction: Toast answers a 429 with
       # a lowercase `retry-after`, and its clients read e.headers['Retry-After'] to know how long to
       # wait. Driven through Faraday's test adapter rather than WebMock, because WebMock title-cases
