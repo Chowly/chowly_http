@@ -468,6 +468,13 @@ describe ChowlyHttp::Client do
           expect(request[:params]).to eq('key' => '[REDACTED]', 'page' => '2')
         end
 
+        it 'redacts a sensitive query param in the STARTED log line, and leaves the rest of the url as sent', :aggregate_failures do
+          error_from('https://fail/404?key=url-leak-secret&page=2')
+          error_from('https://fail/404?page=2&q=a+b')
+          started = log_entries.select { |e| (e[:tags] || []).include?('STARTED') }.map { |e| e[:message] }
+          expect(started).to eq(['GET "https://fail/404?key=%5BREDACTED%5D&page=2"', 'GET "https://fail/404?page=2&q=a+b"'])
+        end
+
         it 'redacts it on an unmapped 5xx too (ServerError path)' do
           err = error_from('https://fail/520?key=url-leak-secret')
           expect(err.response.inspect).not_to include('url-leak-secret')

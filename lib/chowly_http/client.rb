@@ -84,7 +84,7 @@ module ChowlyHttp
       is_json = headers.fetch('Content-Type', nil).to_s.downcase.include?('json')
 
       external_request_id = SecureRandom.hex(4) # Jack: Used to group logs later when searching.
-      logger.info(tags: ["ExtReqID=#{external_request_id}", 'STARTED'], message: "#{method.upcase} \"#{full_url}\"")
+      logger.info(tags: ["ExtReqID=#{external_request_id}", 'STARTED'], message: "#{method.upcase} \"#{redact_url(full_url)}\"")
       logger.info(tags: ["ExtReqID=#{external_request_id}", 'HEADERS'], message: redact_headers(headers))
       logger.info(tags: ["ExtReqID=#{external_request_id}", 'PROXY'], message: sanitize_proxy(proxy))
       logger.info(tags: ["ExtReqID=#{external_request_id}", 'BODY'], message: body) if debug
@@ -295,7 +295,9 @@ module ChowlyHttp
       #
       # redact_url - Return the url with the value of every sensitive query
       # param replaced by REDACTED, as the same type it came in (Faraday keeps
-      # a URI on the error's request). A query that cannot be parsed is dropped.
+      # a URI on the error's request). A url with no sensitive param comes back
+      # untouched, so most log lines don't change; a query that cannot be
+      # parsed is dropped.
       #
       # @param [URI, String, nil] url
       #
@@ -305,13 +307,15 @@ module ChowlyHttp
         return url if url.nil?
 
         uri = URI.parse(url.to_s)
-        if uri.query
-          begin
-            pairs = URI.decode_www_form(uri.query).map { |name, value| [name, sensitive_name?(name) ? REDACTED : value] }
-            uri.query = URI.encode_www_form(pairs)
-          rescue ArgumentError
-            uri.query = nil
-          end
+        return url unless uri.query
+
+        begin
+          pairs = URI.decode_www_form(uri.query)
+          return url unless pairs.any? { |name, _| sensitive_name?(name) }
+
+          uri.query = URI.encode_www_form(pairs.map { |name, value| [name, sensitive_name?(name) ? REDACTED : value] })
+        rescue ArgumentError
+          uri.query = nil
         end
         url.is_a?(URI::Generic) ? uri : uri.to_s
       rescue URI::InvalidURIError
